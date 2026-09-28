@@ -15,9 +15,11 @@ from ..domain.models import (
     Material,
     MaterialVersion,
     Objection,
+    PackageCorrection,
     PackageEntry,
     ReviewPackage,
     ReviewRequest,
+    SealConfirmation,
     User,
 )
 
@@ -115,6 +117,41 @@ class Repository(abc.ABC):
         **fields,
     ) -> bool:
         """条件更新；状态不再是 expected_status 时返回 False（并发冲突）。"""
+
+    # ---- 双人封存 ----
+    @abc.abstractmethod
+    def insert_seal_confirmation(self, confirmation: SealConfirmation) -> None: ...
+
+    @abc.abstractmethod
+    def list_seal_confirmations(
+        self, package_id: str, *, include_revoked: bool = True
+    ) -> list[SealConfirmation]:
+        """按确认顺序（seq）返回封存确认；默认含已撤回记录。"""
+
+    @abc.abstractmethod
+    def mark_seal_confirmation_revoked(
+        self,
+        confirmation_id: str,
+        *,
+        revoked_at: str,
+        revoked_by: str,
+        reason: str,
+    ) -> bool:
+        """追加撤回标记；只能撤回仍有效的确认，返回是否生效。"""
+
+    @abc.abstractmethod
+    def insert_correction(self, correction: PackageCorrection) -> None: ...
+
+    @abc.abstractmethod
+    def get_correction(self, correction_id: str) -> PackageCorrection | None: ...
+
+    @abc.abstractmethod
+    def list_corrections(self, package_id: str) -> list[PackageCorrection]: ...
+
+    @abc.abstractmethod
+    def mark_correction_applied(
+        self, correction_id: str, successor_package_id: str
+    ) -> bool: ...
 
     # ---- 评审请求 ----
     @abc.abstractmethod

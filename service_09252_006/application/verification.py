@@ -12,8 +12,11 @@ from dataclasses import dataclass, field
 from ..domain.fingerprint import (
     digest_bytes,
     manifest_fingerprint,
+    manifest_fingerprint_v2,
     review_record_fingerprint,
+    seal_content_digest,
 )
+from ..domain.enums import Role
 
 
 @dataclass
@@ -99,6 +102,12 @@ def _verify_packages(conn: sqlite3.Connection, report: VerificationReport) -> No
     packages = conn.execute("SELECT * FROM packages").fetchall()
     report.package_count = len(packages)
 
+    table_names = {
+        r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        )
+    }
+
     # version_id -> withdrawn，供封存清单引用检查
     withdrawn_versions = {
         r["version_id"]: bool(r["withdrawn"])
@@ -155,24 +164,55 @@ def _verify_packages(conn: sqlite3.Connection, report: VerificationReport) -> No
                     sha256=entry["sha256"],
                 )
 
+        entry_payload = [
+            {
+                "material_id": e["material_id"],
+                "version_id": e["version_id"],
+                "sha256": e["sha256"],
+                "kind": e["kind"],
+                "sensitivity": e["sensitivity"],
+            }
+            for e in entries
+        ]
+
         if pkg["status"] in ("sealed", "under_review", "decided"):
             report.sealed_count += 1
-            expected = manifest_fingerprint(
-                pkg["package_id"],
-                pkg["institution_id"],
-                [
-                    {
-                        "material_id": e["material_id"],
-                        "version_id": e["version_id"],
-                        "sha256": e["sha256"],
-                        "kind": e["kind"],
-                        "sensitivity": e["sensitivity"],
-                    }
-                    for e in entries
-                ],
-                pkg["sealed_at"],
-            )
+
+            confirmations = []
+            if "seal_confirmations" in table_names:
+                confirmations = conn.execute(
+                    "SELECT * FROM seal_confirmations WHERE package_id = ?"
+                    " AND revoked_at IS NULL ORDER BY seq",
+                    (pkg["package_id"],),
+                ).fetchall()
+
             stored = pkg["manifest_fingerprint"]
+            if confirmations:
+                expected = manifest_fingerprint_v2(
+                    pkg["package_id"],
+                    pkg["institution_id"],
+                    entry_payload,
+                    pkg["sealed_at"],
+                    [
+                        {
+                            "seq": c["seq"],
+                            "role": c["role"],
+                            "confirmer_id": c["confirmer_id"],
+                            "sha256": c["sha256"],
+                            "confirmed_at": c["confirmed_at"],
+                        }
+                        for c in confirmations
+                    ],
+                )
+                _verify_dual_seal(conn, pkg, entry_payload, confirmations, report)
+            else:
+                # 历史库（v1 单人封存）：按 v1 指纹核验
+                expected = manifest_fingerprint(
+                    pkg["package_id"],
+                    pkg["institution_id"],
+                    entry_payload,
+                    pkg["sealed_at"],
+                )
             if stored != expected:
                 report.fail(
                     "manifest_fingerprint_mismatch",
@@ -241,3 +281,65 @@ def _verify_packages(conn: sqlite3.Connection, report: VerificationReport) -> No
                     stored=pkg["review_fingerprint"],
                     expected=expected_review,
                 )
+
+
+def _verify_dual_seal(
+    conn: sqlite3.Connection,
+    pkg: sqlite3.Row,
+    entry_payload: list[dict],
+    confirmations: list[sqlite3.Row],
+    report: VerificationReport,
+) -> None:
+    """双人封存的离线不变量：两人、两种角色、同校验和、顺序为 1/2。"""
+    pid = pkg["package_id"]
+    expected_digest = seal_content_digest(entry_payload)
+    expected_roles = {Role.INSTITUTION_ADMIN.value, Role.QUALITY_AUTHORITY.value}
+
+    if len(confirmations) != 2:
+        report.fail(
+            "seal_confirmation_count_invalid",
+            package_id=pid, count=len(confirmations), expected=2,
+        )
+        return
+
+    seqs = sorted(c["seq"] for c in confirmations)
+    if seqs != [1, 2]:
+        report.fail(
+            "seal_confirmation_order_invalid",
+            package_id=pid, seqs=seqs, expected=[1, 2],
+        )
+
+    roles = {c["role"] for c in confirmations}
+    if roles != expected_roles:
+        report.fail(
+            "seal_confirmation_roles_invalid",
+            package_id=pid, roles=sorted(roles), expected=sorted(expected_roles),
+        )
+
+    people = [c["confirmer_id"] for c in confirmations]
+    if len(set(people)) != 2:
+        report.fail(
+            "seal_confirmation_same_person",
+            package_id=pid, confirmers=people,
+        )
+
+    for c in confirmations:
+        if c["sha256"] != expected_digest:
+            report.fail(
+                "seal_confirmation_digest_mismatch",
+                package_id=pid, confirmer_id=c["confirmer_id"], seq=c["seq"],
+                stored=c["sha256"], expected=expected_digest,
+            )
+
+    # 已封存包不应残留“进行中（已撤回）”的确认之外的有效冲突：仅核验
+    # 不存在与封存校验和不一致的、被撤回后遗留的不同内容确认（信息性警告）。
+    revoked = conn.execute(
+        "SELECT COUNT(*) AS n FROM seal_confirmations"
+        " WHERE package_id = ? AND revoked_at IS NOT NULL",
+        (pid,),
+    ).fetchone()["n"]
+    if revoked:
+        report.warn(
+            "seal_confirmation_revoked_history",
+            package_id=pid, revoked_count=revoked,
+        )

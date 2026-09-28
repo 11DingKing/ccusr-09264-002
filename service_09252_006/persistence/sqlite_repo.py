@@ -21,13 +21,181 @@ from ..domain.models import (
     Material,
     MaterialVersion,
     Objection,
+    PackageCorrection,
     PackageEntry,
     ReviewPackage,
     ReviewRequest,
+    SealConfirmation,
     User,
 )
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+
+_SCHEMA_V1 = """
+    CREATE TABLE IF NOT EXISTS users (
+        user_id        TEXT PRIMARY KEY,
+        institution_id TEXT,
+        roles_json     TEXT NOT NULL,
+        display_name   TEXT NOT NULL DEFAULT ''
+    );
+
+    CREATE TABLE IF NOT EXISTS blobs (
+        sha256     TEXT PRIMARY KEY,
+        data       BLOB NOT NULL,
+        media_type TEXT NOT NULL,
+        size       INTEGER NOT NULL,
+        created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS materials (
+        material_id        TEXT PRIMARY KEY,
+        institution_id     TEXT NOT NULL,
+        kind               TEXT NOT NULL,
+        sensitivity        TEXT NOT NULL,
+        title              TEXT NOT NULL,
+        current_version_id TEXT,
+        withdrawn          INTEGER NOT NULL DEFAULT 0,
+        created_at         TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS versions (
+        version_id              TEXT PRIMARY KEY,
+        material_id             TEXT NOT NULL REFERENCES materials(material_id),
+        institution_id          TEXT NOT NULL,
+        sha256                  TEXT NOT NULL,
+        size                    INTEGER NOT NULL,
+        media_type              TEXT NOT NULL,
+        version_no              INTEGER NOT NULL,
+        supersedes_version_id   TEXT,
+        created_by              TEXT NOT NULL,
+        created_at              TEXT NOT NULL,
+        withdrawn               INTEGER NOT NULL DEFAULT 0,
+        withdrawn_at            TEXT,
+        UNIQUE(material_id, version_no)
+    );
+
+    CREATE TABLE IF NOT EXISTS packages (
+        package_id            TEXT PRIMARY KEY,
+        institution_id        TEXT NOT NULL,
+        title                 TEXT NOT NULL,
+        status                TEXT NOT NULL,
+        created_by            TEXT NOT NULL,
+        created_at            TEXT NOT NULL,
+        sealed_at             TEXT,
+        manifest_fingerprint  TEXT,
+        decided_at            TEXT,
+        decision              TEXT,
+        decision_note         TEXT,
+        review_fingerprint    TEXT,
+        supersedes_package_id TEXT
+    );
+
+    CREATE TABLE IF NOT EXISTS entries (
+        entry_id    TEXT PRIMARY KEY,
+        package_id  TEXT NOT NULL REFERENCES packages(package_id),
+        material_id TEXT NOT NULL,
+        version_id  TEXT NOT NULL REFERENCES versions(version_id),
+        sha256      TEXT NOT NULL,
+        kind        TEXT NOT NULL,
+        sensitivity TEXT NOT NULL,
+        added_at    TEXT NOT NULL,
+        UNIQUE(package_id, version_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS requests (
+        request_id       TEXT PRIMARY KEY,
+        package_id       TEXT NOT NULL REFERENCES packages(package_id),
+        institution_id   TEXT NOT NULL,
+        reviewer_id      TEXT NOT NULL,
+        status           TEXT NOT NULL,
+        assigned_by      TEXT NOT NULL,
+        assigned_at      TEXT NOT NULL,
+        responded_at     TEXT,
+        completed_at     TEXT,
+        verdict          TEXT,
+        comment          TEXT,
+        deadline_at_utc  TEXT,
+        deadline_timezone TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_requests_reviewer
+        ON requests(reviewer_id, status);
+    CREATE INDEX IF NOT EXISTS idx_requests_package ON requests(package_id);
+
+    CREATE TABLE IF NOT EXISTS objections (
+        objection_id  TEXT PRIMARY KEY,
+        request_id    TEXT NOT NULL REFERENCES requests(request_id),
+        package_id    TEXT NOT NULL REFERENCES packages(package_id),
+        institution_id TEXT NOT NULL,
+        reviewer_id   TEXT NOT NULL,
+        category      TEXT NOT NULL,
+        detail        TEXT NOT NULL,
+        created_at    TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS audit_log (
+        audit_id       TEXT PRIMARY KEY,
+        package_id     TEXT,
+        institution_id TEXT,
+        actor_id       TEXT NOT NULL,
+        action         TEXT NOT NULL,
+        at             TEXT NOT NULL,
+        detail_json    TEXT NOT NULL DEFAULT '{}'
+    );
+
+    CREATE TABLE IF NOT EXISTS idempotency (
+        idempotency_key TEXT PRIMARY KEY,
+        result_json     TEXT NOT NULL,
+        created_at      TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS api_tokens (
+        token       TEXT PRIMARY KEY,
+        user_id     TEXT NOT NULL REFERENCES users(user_id),
+        created_at  TEXT NOT NULL
+    );
+
+    PRAGMA user_version = 1;
+"""
+
+# v2：双人封存——确认记录（校验和 + 确认顺序）与封存后更正记录。
+_SCHEMA_V2 = """
+    CREATE TABLE IF NOT EXISTS seal_confirmations (
+        confirmation_id TEXT PRIMARY KEY,
+        package_id      TEXT NOT NULL REFERENCES packages(package_id),
+        role            TEXT NOT NULL,
+        confirmer_id    TEXT NOT NULL,
+        confirmer_name  TEXT NOT NULL DEFAULT '',
+        seq             INTEGER NOT NULL,
+        sha256          TEXT NOT NULL,
+        confirmed_at    TEXT NOT NULL,
+        revoked_at      TEXT,
+        revoked_by      TEXT,
+        revoke_reason   TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_seal_conf_package
+        ON seal_confirmations(package_id);
+    -- 同一封存的同一确认顺序只允许一条“仍有效”的确认；撤回后该顺序可重新确认
+    CREATE UNIQUE INDEX IF NOT EXISTS uniq_seal_conf_active_seq
+        ON seal_confirmations(package_id, seq) WHERE revoked_at IS NULL;
+
+    CREATE TABLE IF NOT EXISTS package_corrections (
+        correction_id        TEXT PRIMARY KEY,
+        package_id           TEXT NOT NULL REFERENCES packages(package_id),
+        institution_id       TEXT NOT NULL,
+        requester_id         TEXT NOT NULL,
+        reason               TEXT NOT NULL,
+        material_id          TEXT,
+        version_id           TEXT,
+        note                 TEXT,
+        status               TEXT NOT NULL DEFAULT 'requested',
+        successor_package_id TEXT,
+        created_at           TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_corrections_package
+        ON package_corrections(package_id);
+
+    PRAGMA user_version = 2;
+"""
 
 
 class SqliteRepository(Repository):
@@ -51,134 +219,12 @@ class SqliteRepository(Repository):
         version = self._conn.execute("PRAGMA user_version").fetchone()[0]
         if version >= SCHEMA_VERSION:
             return
-        # executescript 会自行提交事务；把 user_version 写入放在同一脚本
-        self._conn.executescript(
-            """
-                CREATE TABLE IF NOT EXISTS users (
-                    user_id        TEXT PRIMARY KEY,
-                    institution_id TEXT,
-                    roles_json     TEXT NOT NULL,
-                    display_name   TEXT NOT NULL DEFAULT ''
-                );
-
-                CREATE TABLE IF NOT EXISTS blobs (
-                    sha256     TEXT PRIMARY KEY,
-                    data       BLOB NOT NULL,
-                    media_type TEXT NOT NULL,
-                    size       INTEGER NOT NULL,
-                    created_at TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS materials (
-                    material_id        TEXT PRIMARY KEY,
-                    institution_id     TEXT NOT NULL,
-                    kind               TEXT NOT NULL,
-                    sensitivity        TEXT NOT NULL,
-                    title              TEXT NOT NULL,
-                    current_version_id TEXT,
-                    withdrawn          INTEGER NOT NULL DEFAULT 0,
-                    created_at         TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS versions (
-                    version_id              TEXT PRIMARY KEY,
-                    material_id             TEXT NOT NULL REFERENCES materials(material_id),
-                    institution_id          TEXT NOT NULL,
-                    sha256                  TEXT NOT NULL,
-                    size                    INTEGER NOT NULL,
-                    media_type              TEXT NOT NULL,
-                    version_no              INTEGER NOT NULL,
-                    supersedes_version_id   TEXT,
-                    created_by              TEXT NOT NULL,
-                    created_at              TEXT NOT NULL,
-                    withdrawn               INTEGER NOT NULL DEFAULT 0,
-                    withdrawn_at            TEXT,
-                    UNIQUE(material_id, version_no)
-                );
-
-                CREATE TABLE IF NOT EXISTS packages (
-                    package_id            TEXT PRIMARY KEY,
-                    institution_id        TEXT NOT NULL,
-                    title                 TEXT NOT NULL,
-                    status                TEXT NOT NULL,
-                    created_by            TEXT NOT NULL,
-                    created_at            TEXT NOT NULL,
-                    sealed_at             TEXT,
-                    manifest_fingerprint  TEXT,
-                    decided_at            TEXT,
-                    decision              TEXT,
-                    decision_note         TEXT,
-                    review_fingerprint    TEXT,
-                    supersedes_package_id TEXT
-                );
-
-                CREATE TABLE IF NOT EXISTS entries (
-                    entry_id    TEXT PRIMARY KEY,
-                    package_id  TEXT NOT NULL REFERENCES packages(package_id),
-                    material_id TEXT NOT NULL,
-                    version_id  TEXT NOT NULL REFERENCES versions(version_id),
-                    sha256      TEXT NOT NULL,
-                    kind        TEXT NOT NULL,
-                    sensitivity TEXT NOT NULL,
-                    added_at    TEXT NOT NULL,
-                    UNIQUE(package_id, version_id)
-                );
-
-                CREATE TABLE IF NOT EXISTS requests (
-                    request_id       TEXT PRIMARY KEY,
-                    package_id       TEXT NOT NULL REFERENCES packages(package_id),
-                    institution_id   TEXT NOT NULL,
-                    reviewer_id      TEXT NOT NULL,
-                    status           TEXT NOT NULL,
-                    assigned_by      TEXT NOT NULL,
-                    assigned_at      TEXT NOT NULL,
-                    responded_at     TEXT,
-                    completed_at     TEXT,
-                    verdict          TEXT,
-                    comment          TEXT,
-                    deadline_at_utc  TEXT,
-                    deadline_timezone TEXT
-                );
-                CREATE INDEX IF NOT EXISTS idx_requests_reviewer
-                    ON requests(reviewer_id, status);
-                CREATE INDEX IF NOT EXISTS idx_requests_package ON requests(package_id);
-
-                CREATE TABLE IF NOT EXISTS objections (
-                    objection_id  TEXT PRIMARY KEY,
-                    request_id    TEXT NOT NULL REFERENCES requests(request_id),
-                    package_id    TEXT NOT NULL REFERENCES packages(package_id),
-                    institution_id TEXT NOT NULL,
-                    reviewer_id   TEXT NOT NULL,
-                    category      TEXT NOT NULL,
-                    detail        TEXT NOT NULL,
-                    created_at    TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS audit_log (
-                    audit_id       TEXT PRIMARY KEY,
-                    package_id     TEXT,
-                    institution_id TEXT,
-                    actor_id       TEXT NOT NULL,
-                    action         TEXT NOT NULL,
-                    at             TEXT NOT NULL,
-                    detail_json    TEXT NOT NULL DEFAULT '{}'
-                );
-
-                CREATE TABLE IF NOT EXISTS idempotency (
-                    idempotency_key TEXT PRIMARY KEY,
-                    result_json     TEXT NOT NULL,
-                    created_at      TEXT NOT NULL
-                );
-
-                CREATE TABLE IF NOT EXISTS api_tokens (
-                    token       TEXT PRIMARY KEY,
-                    user_id     TEXT NOT NULL REFERENCES users(user_id),
-                    created_at  TEXT NOT NULL
-                );
-
-                PRAGMA user_version = 1;
-            """
-        )
+        # 增量迁移：v1 建基础表；v2 追加双人封存表。每个 executescript
+        # 自行提交，并在同一脚本内写入 user_version。
+        if version < 1:
+            self._conn.executescript(_SCHEMA_V1)
+        if version < 2:
+            self._conn.executescript(_SCHEMA_V2)
 
     @contextlib.contextmanager
     def _txn_direct(self) -> Iterator[None]:
@@ -513,6 +559,100 @@ class SqliteRepository(Repository):
         )
         return cur.rowcount == 1
 
+    # ------------------------------------------------------- 双人封存/更正
+    def insert_seal_confirmation(self, confirmation: SealConfirmation) -> None:
+        self._conn.execute(
+            "INSERT INTO seal_confirmations(confirmation_id, package_id, role,"
+            " confirmer_id, confirmer_name, seq, sha256, confirmed_at,"
+            " revoked_at, revoked_by, revoke_reason)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                confirmation.confirmation_id,
+                confirmation.package_id,
+                confirmation.role,
+                confirmation.confirmer_id,
+                confirmation.confirmer_name,
+                confirmation.seq,
+                confirmation.sha256,
+                confirmation.confirmed_at,
+                confirmation.revoked_at,
+                confirmation.revoked_by,
+                confirmation.revoke_reason,
+            ),
+        )
+
+    def list_seal_confirmations(
+        self, package_id: str, *, include_revoked: bool = True
+    ) -> list[SealConfirmation]:
+        sql = (
+            "SELECT * FROM seal_confirmations WHERE package_id = ?"
+            + ("" if include_revoked else " AND revoked_at IS NULL")
+            + " ORDER BY seq"
+        )
+        rows = self._conn.execute(sql, (package_id,)).fetchall()
+        return [_row_to_seal_confirmation(r) for r in rows]
+
+    def mark_seal_confirmation_revoked(
+        self,
+        confirmation_id: str,
+        *,
+        revoked_at: str,
+        revoked_by: str,
+        reason: str,
+    ) -> bool:
+        # 只允许撤回仍有效（未撤回）的确认；已封存包的确认由调用方在服务层拒绝
+        cur = self._conn.execute(
+            "UPDATE seal_confirmations SET revoked_at = ?, revoked_by = ?,"
+            " revoke_reason = ? WHERE confirmation_id = ? AND revoked_at IS NULL",
+            (revoked_at, revoked_by, reason, confirmation_id),
+        )
+        return cur.rowcount == 1
+
+    def insert_correction(self, correction: PackageCorrection) -> None:
+        self._conn.execute(
+            "INSERT INTO package_corrections(correction_id, package_id,"
+            " institution_id, requester_id, reason, material_id, version_id,"
+            " note, status, successor_package_id, created_at)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                correction.correction_id,
+                correction.package_id,
+                correction.institution_id,
+                correction.requester_id,
+                correction.reason,
+                correction.material_id,
+                correction.version_id,
+                correction.note,
+                correction.status,
+                correction.successor_package_id,
+                correction.created_at,
+            ),
+        )
+
+    def get_correction(self, correction_id: str) -> PackageCorrection | None:
+        row = self._conn.execute(
+            "SELECT * FROM package_corrections WHERE correction_id = ?",
+            (correction_id,),
+        ).fetchone()
+        return None if row is None else _row_to_correction(row)
+
+    def list_corrections(self, package_id: str) -> list[PackageCorrection]:
+        rows = self._conn.execute(
+            "SELECT * FROM package_corrections WHERE package_id = ? ORDER BY created_at",
+            (package_id,),
+        ).fetchall()
+        return [_row_to_correction(r) for r in rows]
+
+    def mark_correction_applied(
+        self, correction_id: str, successor_package_id: str
+    ) -> bool:
+        cur = self._conn.execute(
+            "UPDATE package_corrections SET status = 'applied',"
+            " successor_package_id = ? WHERE correction_id = ? AND status = 'requested'",
+            (successor_package_id, correction_id),
+        )
+        return cur.rowcount == 1
+
     # --------------------------------------------------------------- requests
     def insert_request(self, request: ReviewRequest) -> None:
         self._conn.execute(
@@ -716,4 +856,36 @@ def _row_to_entry(row: sqlite3.Row) -> PackageEntry:
         kind=row["kind"],
         sensitivity=row["sensitivity"],
         added_at=row["added_at"],
+    )
+
+
+def _row_to_seal_confirmation(row: sqlite3.Row) -> SealConfirmation:
+    return SealConfirmation(
+        confirmation_id=row["confirmation_id"],
+        package_id=row["package_id"],
+        role=row["role"],
+        confirmer_id=row["confirmer_id"],
+        confirmer_name=row["confirmer_name"],
+        seq=row["seq"],
+        sha256=row["sha256"],
+        confirmed_at=row["confirmed_at"],
+        revoked_at=row["revoked_at"],
+        revoked_by=row["revoked_by"],
+        revoke_reason=row["revoke_reason"],
+    )
+
+
+def _row_to_correction(row: sqlite3.Row) -> PackageCorrection:
+    return PackageCorrection(
+        correction_id=row["correction_id"],
+        package_id=row["package_id"],
+        institution_id=row["institution_id"],
+        requester_id=row["requester_id"],
+        reason=row["reason"],
+        material_id=row["material_id"],
+        version_id=row["version_id"],
+        note=row["note"],
+        status=row["status"],
+        successor_package_id=row["successor_package_id"],
+        created_at=row["created_at"],
     )

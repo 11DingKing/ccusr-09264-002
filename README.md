@@ -14,11 +14,27 @@
   服务端重算摘要，客户端可传 `expected_sha256` 做端到端校验。
 - 同一逻辑材料有不可变的版本链（`versions.supersedes_version_id`），
   重复上传相同字节返回既有版本。
-- 评审包封存时，对“包内每个条目的 material/version/sha256/kind/敏感度
-  + 封存时刻”做规范化 JSON 哈希，得到 **manifest_fingerprint**。封存后
-  再上传新版本或撤回材料都**不改变历史包**。
+- **封存前双人确认**：封存会议前，评审办公室由**两名不同角色、两名不同
+  人员**（机构管理员 + 质量权威机构）先后对证据包内容做确认。两人确认
+  的必须是同一 **内容校验和**（`seal_content_digest`，仅依赖清单内容，
+  与封存时刻无关）；服务端始终以库内清单重算为准，客户端可传
+  `content_sha256` 端到端比对。确认顺序（seq=1/2）与校验和存入
+  `seal_confirmations`。
+- 第一人确认后清单即**锁定**；第二人确认完成前第一人可**撤回**自己的
+  确认（追加撤回标记），撤回后包恢复草稿、可再改动，之后重新双人确认。
+  封存一旦完成，确认不可撤回。
+- 第二人确认完成即封存：对“包内每个条目的 material/version/sha256/kind/
+  敏感度 + 封存时刻 + 内容校验和 + 两人确认（角色/人员/顺序）”做规范化
+  JSON 哈希，得到 **manifest_fingerprint（v2）**。封存后再上传新版本或
+  撤回材料都**不改变历史包**。历史 v1 库（无双人确认）仍按 v1 指纹核验。
 - 签发结论时对全部评审请求与异议再哈希，得到 **review_fingerprint**，
   其中嵌入 manifest_fingerprint，形成证据链。
+
+### 封存后更正
+- 已封存/评审中/已决定的包拒绝任何直接改动（`409 correction_required`）。
+- 改动必须先**登记更正**（`package_corrections`，append-only，不触动已
+  封存证据）；待包签发后，创建复审包时原包的更正自动标记为 `applied`、
+  指向承接它的复审包。
 
 ### 后补文件只能复审
 - 已封存/已决定的包拒绝追加材料（`409 immutability_violation`）。
@@ -96,7 +112,11 @@ python3 -m service_09252_006.cli verify --db ./data/qe.db [--json]
 | POST | `/v1/materials/{id}/withdraw` | 撤回整份材料 |
 | POST | `/v1/packages` | 建评审包（可带 `supersedes_package_id`） |
 | POST | `/v1/packages/{id}/entries` | 草稿包追加版本 |
-| POST | `/v1/packages/{id}/seal` | 封存（固定清单指纹） |
+| POST | `/v1/packages/{id}/seal` | 双人封存确认（两种角色各调一次，第二人完成封存） |
+| GET  | `/v1/packages/{id}/seal` | 封存进度：内容校验和、确认角色/顺序 |
+| POST | `/v1/packages/{id}/seal/withdrawal` | 第二人确认前撤回本人确认 |
+| POST | `/v1/packages/{id}/corrections` | 封存后登记更正（append-only） |
+| GET  | `/v1/packages/{id}/corrections` | 更正记录（含复审承接状态） |
 | GET  | `/v1/packages/{id}` | 包视图（敏感条目按权限遮蔽） |
 | GET  | `/v1/packages/{id}/entries/{vid}/content` | 授权下载内容字节 |
 | POST | `/v1/packages/{id}/assignments` | 分配评审（可带跨时区截止） |
@@ -107,8 +127,9 @@ python3 -m service_09252_006.cli verify --db ./data/qe.db [--json]
 | POST | `/v1/requests/{id}/cancel` | 取消分配（即时收回敏感访问权） |
 | POST | `/v1/packages/{id}/decision` | 签发 approved/needs_revision/rejected |
 
-评审状态机：`draft → sealed → under_review → decided`；复审包重新走一遍，
-旧包不复活。
+评审状态机：`draft →（双人确认封存）→ sealed → under_review → decided`；
+复审包重新走一遍，旧包不复活。封存需要两种角色、两名人员各确认一次同一
+内容校验和。
 
 ## 测试
 

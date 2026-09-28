@@ -129,7 +129,7 @@ class HttpApiTests(unittest.TestCase):
         self.assertEqual(ver["version_id"], ver2["version_id"])
         self.assertTrue(ver2["replayed"])
 
-        # 组包封存
+        # 组包 + 双人封存（机构管理员先确认，质量权威机构第二人确认）
         status, pkg = admin.request("POST", "/v1/packages", {"title": "2026秋"})
         pid = pkg["package_id"]
         status, _ = admin.request(
@@ -137,9 +137,21 @@ class HttpApiTests(unittest.TestCase):
             {"version_id": ver["version_id"]},
         )
         self.assertEqual(status, 201)
-        status, sealed = admin.request("POST", f"/v1/packages/{pid}/seal", {})
+        status, first = admin.request(
+            "POST", f"/v1/packages/{pid}/seal", {}
+        )
         self.assertEqual(status, 200)
+        self.assertFalse(first["sealed"])
+        self.assertEqual(first["active_confirmation_count"], 1)
+        self.assertEqual(first["confirmed_roles"], ["institution_admin"])
+        status, sealed = authority.request(
+            "POST", f"/v1/packages/{pid}/seal", {}
+        )
+        self.assertEqual(status, 200)
+        self.assertTrue(sealed["sealed"])
+        self.assertEqual(sealed["active_confirmation_count"], 2)
         self.assertIn("manifest_fingerprint", sealed)
+        self.assertEqual(sealed["status"], "sealed")
 
         # 提交人看不到敏感反馈内容
         status, view = submitter.request("GET", f"/v1/packages/{pid}")

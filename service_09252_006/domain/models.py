@@ -99,6 +99,49 @@ class ReviewPackage:
 
 
 @dataclass
+class SealConfirmation:
+    """双人封存中的一次角色确认。
+
+    两名不同角色（机构管理员、质量权威机构）、两名不同人员各自确认同一
+    内容校验和，seq 记录确认顺序（1/2）；封存完成前可撤回（revoked_at
+    置位），封存完成后确认记录永久保留、不可撤回。
+    """
+
+    confirmation_id: str
+    package_id: str
+    role: str                       # Role：仅两种封存角色
+    confirmer_id: str
+    confirmer_name: str
+    seq: int                        # 确认顺序：第一人 1，第二人 2
+    sha256: str                     # 确认时的清单内容校验和
+    confirmed_at: str
+    revoked_at: Optional[str] = None
+    revoked_by: Optional[str] = None
+    revoke_reason: Optional[str] = None
+
+
+@dataclass
+class PackageCorrection:
+    """封存后的更正记录（追加，不改动已封存证据）。
+
+    封存/评审中/已决定的包不允许直接改动；任何更正必须先在此登记，
+    待包签发后由复审（supersedes）包承接，承接时 status 置为 applied。
+    """
+
+    correction_id: str
+    package_id: str
+    institution_id: str
+    requester_id: str
+    reason: str
+    material_id: Optional[str]
+    version_id: Optional[str]
+    note: Optional[str]
+    status: str                     # requested / applied
+    successor_package_id: Optional[str]
+    created_at: str
+
+
+@dataclass
 class ReviewRequest:
     request_id: str
     package_id: str

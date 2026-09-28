@@ -46,6 +46,12 @@ class ImmutabilityError(ConflictError):
     code = "immutability_violation"
 
 
+class CorrectionRequiredError(ImmutabilityError):
+    """封存后直接改动证据被拒；必须先登记更正、走复审流程。"""
+
+    code = "correction_required"
+
+
 class DeadlineExceededError(ConflictError):
     code = "deadline_exceeded"
     http_status = 409

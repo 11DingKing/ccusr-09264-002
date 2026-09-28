@@ -282,14 +282,51 @@ class ApiHandler(BaseHTTPRequestHandler):
         )
         self._send_json(201, result)
 
-    def seal_package(self, package_id: str) -> None:
+    def confirm_seal(self, package_id: str) -> None:
         actor = self._actor()
-        result = self.services.packages.seal_package(
+        body = self._read_json()
+        result = self.services.packages.confirm_seal(
             actor,
             package_id=package_id,
+            content_sha256=body.get("content_sha256"),
             idempotency_key=self._idempotency_key(),
         )
         self._send_json(200, result)
+
+    def get_seal_status(self, package_id: str) -> None:
+        actor = self._actor()
+        self._send_json(200, self.services.packages.get_seal_status(actor, package_id))
+
+    def withdraw_seal_confirmation(self, package_id: str) -> None:
+        actor = self._actor()
+        body = self._read_json()
+        result = self.services.packages.withdraw_seal_confirmation(
+            actor,
+            package_id=package_id,
+            reason=body.get("reason", ""),
+            idempotency_key=self._idempotency_key(),
+        )
+        self._send_json(200, result)
+
+    def request_correction(self, package_id: str) -> None:
+        actor = self._actor()
+        body = self._read_json()
+        result = self.services.packages.request_correction(
+            actor,
+            package_id=package_id,
+            reason=body["reason"],
+            material_id=body.get("material_id"),
+            version_id=body.get("version_id"),
+            note=body.get("note", ""),
+            idempotency_key=self._idempotency_key(),
+        )
+        self._send_json(201, result)
+
+    def list_corrections(self, package_id: str) -> None:
+        actor = self._actor()
+        self._send_json(
+            200, {"corrections": self.services.packages.list_corrections(actor, package_id)}
+        )
 
     def download_entry(self, package_id: str, version_id: str) -> None:
         actor = self._actor()
@@ -406,7 +443,9 @@ def _routes() -> dict[str, list[tuple[str, str]]]:
         ("/v1/versions/{version_id}/withdraw", "withdraw_version"),
         ("/v1/packages", "create_package"),
         ("/v1/packages/{package_id}/entries", "add_entry"),
-        ("/v1/packages/{package_id}/seal", "seal_package"),
+        ("/v1/packages/{package_id}/seal", "confirm_seal"),
+        ("/v1/packages/{package_id}/seal/withdrawal", "withdraw_seal_confirmation"),
+        ("/v1/packages/{package_id}/corrections", "request_correction"),
         ("/v1/packages/{package_id}/assignments", "assign"),
         ("/v1/packages/{package_id}/decision", "issue_decision"),
         ("/v1/requests/{request_id}/cancel", "cancel_request"),
@@ -419,6 +458,8 @@ def _routes() -> dict[str, list[tuple[str, str]]]:
         ("/v1/versions/{version_id}", "get_version"),
         ("/v1/packages", "list_packages"),
         ("/v1/packages/{package_id}", "get_package"),
+        ("/v1/packages/{package_id}/seal", "get_seal_status"),
+        ("/v1/packages/{package_id}/corrections", "list_corrections"),
         ("/v1/packages/{package_id}/requests", "list_requests"),
         (
             "/v1/packages/{package_id}/entries/{version_id}/content",

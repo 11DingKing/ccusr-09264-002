@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from service_09252_006.domain.enums import MaterialKind, Sensitivity
+from service_09252_006.domain.enums import MaterialKind, Role, Sensitivity
 
 
 def upload_material(
@@ -22,8 +22,26 @@ def upload_material(
     return SimpleNamespace(material=m, version=v)
 
 
+def two_role_sealers(h, admin):
+    """返回（送审机构管理员, 质量权威机构）两名不同角色的封存确认人。"""
+    authority = h.repo.get_user("auth")
+    if authority is None:
+        from service_09252_006.domain.models import User
+
+        authority = User(
+            user_id="auth", institution_id=None,
+            roles=(Role.QUALITY_AUTHORITY.value,), display_name="权威机构",
+        )
+        h.repo.upsert_user(authority)
+    return admin, authority
+
+
 def seal_new_package(h, admin, *, items=None, title="2026 秋评审包"):
-    """items: [(uploaded,)] 默认为一份大纲 + 一份敏感企业反馈。"""
+    """items: [(uploaded,)] 默认为一份大纲 + 一份敏感企业反馈。
+
+    双人封存：机构管理员先确认，质量权威机构第二人确认（不同角色/人员）。
+    """
+    admin, authority = two_role_sealers(h, admin)
     pkg = h.ctx.packages.create_package(admin, title=title)
     pid = pkg["package_id"]
     if items is None:
@@ -40,8 +58,13 @@ def seal_new_package(h, admin, *, items=None, title="2026 秋评审包"):
         h.ctx.packages.add_entry(
             admin, package_id=pid, version_id=item.version["version_id"]
         )
-    sealed = h.ctx.packages.seal_package(admin, package_id=pid)
-    return SimpleNamespace(package_id=pid, items=items, sealed=sealed)
+    first = h.ctx.packages.confirm_seal(admin, package_id=pid)
+    sealed = h.ctx.packages.confirm_seal(authority, package_id=pid)
+    assert sealed["sealed"], sealed
+    return SimpleNamespace(
+        package_id=pid, items=items, sealed=sealed,
+        first_confirmation=first, confirmer_first=admin, confirmer_second=authority,
+    )
 
 
 def complete_review(
