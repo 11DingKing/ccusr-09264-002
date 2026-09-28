@@ -119,6 +119,65 @@ class VerificationTests(unittest.TestCase):
             any(f["kind"] == "review_fingerprint_mismatch" for f in report.failures)
         )
 
+    def test_dual_seal_confirmation_verifies(self) -> None:
+        sealed = seal_new_package(self.h, self.admin)
+        self.h.ctx.close()
+        report = verify_database(self.h.db_path)
+        self.assertTrue(report.ok, report.failures)
+        self.assertEqual(report.seal_confirmation_count, 1)
+
+    def test_correction_verifies_and_tampering_detected(self) -> None:
+        sealed = seal_new_package(self.h, self.admin)
+        pid = sealed.package_id
+        req = self.h.ctx.packages.request_correction(
+            self.admin, package_id=pid, correction_type="metadata",
+            reason="笔误", detail={"title": "订正标题"},
+        )
+        self.h.ctx.packages.review_correction(
+            self.authority, correction_id=req["correction_id"], approve=True
+        )
+        self.h.ctx.close()
+
+        # 干净：更正指纹可复算
+        report = verify_database(self.h.db_path)
+        self.assertTrue(report.ok, report.failures)
+        self.assertEqual(report.correction_count, 1)
+
+        # 篡改更正原因：指纹失配
+        import sqlite3
+
+        conn = sqlite3.connect(self.h.db_path)
+        conn.execute("UPDATE correction_proposals SET reason = '事后改写原因'")
+        conn.commit()
+        conn.close()
+        report = verify_database(self.h.db_path)
+        self.assertFalse(report.ok)
+        self.assertTrue(
+            any(f["kind"] == "correction_fingerprint_mismatch" for f in report.failures)
+        )
+
+    def test_seal_content_checksum_tampering_detected(self) -> None:
+        sealed = seal_new_package(self.h, self.admin)
+        self.h.ctx.close()
+
+        import sqlite3
+
+        conn = sqlite3.connect(self.h.db_path)
+        conn.execute(
+            "UPDATE seal_confirmations SET content_checksum = ?",
+            ("sha256:" + "9" * 64,),
+        )
+        conn.commit()
+        conn.close()
+        report = verify_database(self.h.db_path)
+        self.assertFalse(report.ok)
+        self.assertTrue(
+            any(
+                f["kind"] == "seal_content_checksum_mismatch"
+                for f in report.failures
+            )
+        )
+
 
 class CliVerifyTests(unittest.TestCase):
     def test_cli_exit_codes(self) -> None:

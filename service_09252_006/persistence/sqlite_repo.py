@@ -18,16 +18,18 @@ from ..domain.fingerprint import digest_bytes
 from ..domain.models import (
     AuditEntry,
     Blob,
+    CorrectionProposal,
     Material,
     MaterialVersion,
     Objection,
     PackageEntry,
     ReviewPackage,
     ReviewRequest,
+    SealConfirmation,
     User,
 )
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class SqliteRepository(Repository):
@@ -176,7 +178,50 @@ class SqliteRepository(Repository):
                     created_at  TEXT NOT NULL
                 );
 
-                PRAGMA user_version = 1;
+                CREATE TABLE IF NOT EXISTS seal_confirmations (
+                    confirmation_id              TEXT PRIMARY KEY,
+                    package_id                   TEXT NOT NULL REFERENCES packages(package_id),
+                    institution_id               TEXT NOT NULL,
+                    status                       TEXT NOT NULL,
+                    content_checksum             TEXT NOT NULL,
+                    entry_count                  INTEGER NOT NULL,
+                    first_confirmer_id           TEXT NOT NULL,
+                    first_confirmer_role         TEXT NOT NULL,
+                    first_confirmed_at           TEXT NOT NULL,
+                    second_confirmer_id          TEXT,
+                    second_confirmer_role        TEXT,
+                    second_confirmed_at          TEXT,
+                    withdrawn_by                 TEXT,
+                    withdrawn_at                 TEXT,
+                    withdraw_reason              TEXT,
+                    sealed_at                    TEXT,
+                    sealed_manifest_fingerprint  TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_seal_confirmations_package
+                    ON seal_confirmations(package_id, status);
+
+                CREATE TABLE IF NOT EXISTS correction_proposals (
+                    correction_id        TEXT PRIMARY KEY,
+                    package_id           TEXT NOT NULL REFERENCES packages(package_id),
+                    institution_id       TEXT NOT NULL,
+                    correction_type      TEXT NOT NULL,
+                    reason               TEXT NOT NULL,
+                    detail_json          TEXT NOT NULL DEFAULT '{}',
+                    status               TEXT NOT NULL,
+                    requested_by         TEXT NOT NULL,
+                    requested_by_role    TEXT NOT NULL,
+                    requested_at         TEXT NOT NULL,
+                    reviewed_by          TEXT,
+                    reviewed_by_role     TEXT,
+                    reviewed_at          TEXT,
+                    review_note          TEXT,
+                    applied_at           TEXT,
+                    change_fingerprint   TEXT
+                );
+                CREATE INDEX IF NOT EXISTS idx_corrections_package
+                    ON correction_proposals(package_id, requested_at);
+
+                PRAGMA user_version = 2;
             """
         )
 
@@ -510,6 +555,216 @@ class SqliteRepository(Repository):
             f"UPDATE packages SET {', '.join(sets)}"
             " WHERE package_id = ? AND status = ?",
             params,
+        )
+        return cur.rowcount == 1
+
+    def rename_package_title(self, package_id: str, title: str) -> bool:
+        cur = self._conn.execute(
+            "UPDATE packages SET title = ? WHERE package_id = ?",
+            (title, package_id),
+        )
+        return cur.rowcount == 1
+
+    # ---------------------------------------------------- 双人封存确认
+    def insert_seal_confirmation(self, confirmation: SealConfirmation) -> None:
+        self._conn.execute(
+            "INSERT INTO seal_confirmations(confirmation_id, package_id, institution_id,"
+            " status, content_checksum, entry_count, first_confirmer_id,"
+            " first_confirmer_role, first_confirmed_at, second_confirmer_id,"
+            " second_confirmer_role, second_confirmed_at, withdrawn_by, withdrawn_at,"
+            " withdraw_reason, sealed_at, sealed_manifest_fingerprint)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                confirmation.confirmation_id,
+                confirmation.package_id,
+                confirmation.institution_id,
+                confirmation.status,
+                confirmation.content_checksum,
+                confirmation.entry_count,
+                confirmation.first_confirmer_id,
+                confirmation.first_confirmer_role,
+                confirmation.first_confirmed_at,
+                confirmation.second_confirmer_id,
+                confirmation.second_confirmer_role,
+                confirmation.second_confirmed_at,
+                confirmation.withdrawn_by,
+                confirmation.withdrawn_at,
+                confirmation.withdraw_reason,
+                confirmation.sealed_at,
+                confirmation.sealed_manifest_fingerprint,
+            ),
+        )
+
+    def _row_to_seal_confirmation(self, row: sqlite3.Row) -> SealConfirmation:
+        return SealConfirmation(
+            confirmation_id=row["confirmation_id"],
+            package_id=row["package_id"],
+            institution_id=row["institution_id"],
+            status=row["status"],
+            content_checksum=row["content_checksum"],
+            entry_count=row["entry_count"],
+            first_confirmer_id=row["first_confirmer_id"],
+            first_confirmer_role=row["first_confirmer_role"],
+            first_confirmed_at=row["first_confirmed_at"],
+            second_confirmer_id=row["second_confirmer_id"],
+            second_confirmer_role=row["second_confirmer_role"],
+            second_confirmed_at=row["second_confirmed_at"],
+            withdrawn_by=row["withdrawn_by"],
+            withdrawn_at=row["withdrawn_at"],
+            withdraw_reason=row["withdraw_reason"],
+            sealed_at=row["sealed_at"],
+            sealed_manifest_fingerprint=row["sealed_manifest_fingerprint"],
+        )
+
+    def get_active_seal_confirmation(
+        self, package_id: str
+    ) -> SealConfirmation | None:
+        row = self._conn.execute(
+            "SELECT * FROM seal_confirmations"
+            " WHERE package_id = ? AND status = 'pending'"
+            " ORDER BY first_confirmed_at DESC LIMIT 1",
+            (package_id,),
+        ).fetchone()
+        return None if row is None else self._row_to_seal_confirmation(row)
+
+    def get_seal_confirmation(self, confirmation_id: str) -> SealConfirmation | None:
+        row = self._conn.execute(
+            "SELECT * FROM seal_confirmations WHERE confirmation_id = ?",
+            (confirmation_id,),
+        ).fetchone()
+        return None if row is None else self._row_to_seal_confirmation(row)
+
+    def list_seal_confirmations(self, package_id: str) -> list[SealConfirmation]:
+        rows = self._conn.execute(
+            "SELECT * FROM seal_confirmations WHERE package_id = ?"
+            " ORDER BY first_confirmed_at",
+            (package_id,),
+        ).fetchall()
+        return [self._row_to_seal_confirmation(r) for r in rows]
+
+    def mark_seal_confirmation_withdrawn(
+        self,
+        confirmation_id: str,
+        withdrawn_by: str,
+        withdrawn_at: str,
+        reason: str,
+    ) -> bool:
+        cur = self._conn.execute(
+            "UPDATE seal_confirmations"
+            " SET status = 'cancelled', withdrawn_by = ?, withdrawn_at = ?,"
+            " withdraw_reason = ?"
+            " WHERE confirmation_id = ? AND status = 'pending'",
+            (withdrawn_by, withdrawn_at, reason, confirmation_id),
+        )
+        return cur.rowcount == 1
+
+    def complete_seal_confirmation(
+        self,
+        confirmation_id: str,
+        second_confirmer_id: str,
+        second_confirmer_role: str,
+        second_confirmed_at: str,
+        sealed_at: str,
+        sealed_manifest_fingerprint: str,
+    ) -> bool:
+        cur = self._conn.execute(
+            "UPDATE seal_confirmations"
+            " SET status = 'sealed', second_confirmer_id = ?,"
+            " second_confirmer_role = ?, second_confirmed_at = ?, sealed_at = ?,"
+            " sealed_manifest_fingerprint = ?"
+            " WHERE confirmation_id = ? AND status = 'pending'",
+            (
+                second_confirmer_id,
+                second_confirmer_role,
+                second_confirmed_at,
+                sealed_at,
+                sealed_manifest_fingerprint,
+                confirmation_id,
+            ),
+        )
+        return cur.rowcount == 1
+
+    # -------------------------------------------------------- 封存后更正
+    def insert_correction(self, correction: CorrectionProposal) -> None:
+        self._conn.execute(
+            "INSERT INTO correction_proposals(correction_id, package_id,"
+            " institution_id, correction_type, reason, detail_json, status,"
+            " requested_by, requested_by_role, requested_at, reviewed_by,"
+            " reviewed_by_role, reviewed_at, review_note, applied_at,"
+            " change_fingerprint)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                correction.correction_id,
+                correction.package_id,
+                correction.institution_id,
+                correction.correction_type,
+                correction.reason,
+                json.dumps(correction.detail, ensure_ascii=False),
+                correction.status,
+                correction.requested_by,
+                correction.requested_by_role,
+                correction.requested_at,
+                correction.reviewed_by,
+                correction.reviewed_by_role,
+                correction.reviewed_at,
+                correction.review_note,
+                correction.applied_at,
+                correction.change_fingerprint,
+            ),
+        )
+
+    def _row_to_correction(self, row: sqlite3.Row) -> CorrectionProposal:
+        return CorrectionProposal(
+            correction_id=row["correction_id"],
+            package_id=row["package_id"],
+            institution_id=row["institution_id"],
+            correction_type=row["correction_type"],
+            reason=row["reason"],
+            detail=json.loads(row["detail_json"]),
+            status=row["status"],
+            requested_by=row["requested_by"],
+            requested_by_role=row["requested_by_role"],
+            requested_at=row["requested_at"],
+            reviewed_by=row["reviewed_by"],
+            reviewed_by_role=row["reviewed_by_role"],
+            reviewed_at=row["reviewed_at"],
+            review_note=row["review_note"],
+            applied_at=row["applied_at"],
+            change_fingerprint=row["change_fingerprint"],
+        )
+
+    def get_correction(self, correction_id: str) -> CorrectionProposal | None:
+        row = self._conn.execute(
+            "SELECT * FROM correction_proposals WHERE correction_id = ?",
+            (correction_id,),
+        ).fetchone()
+        return None if row is None else self._row_to_correction(row)
+
+    def list_corrections(self, package_id: str) -> list[CorrectionProposal]:
+        rows = self._conn.execute(
+            "SELECT * FROM correction_proposals WHERE package_id = ?"
+            " ORDER BY requested_at",
+            (package_id,),
+        ).fetchall()
+        return [self._row_to_correction(r) for r in rows]
+
+    def update_correction(self, correction: CorrectionProposal) -> bool:
+        cur = self._conn.execute(
+            "UPDATE correction_proposals SET status = ?, reviewed_by = ?,"
+            " reviewed_by_role = ?, reviewed_at = ?, review_note = ?,"
+            " applied_at = ?, change_fingerprint = ?, detail_json = ?"
+            " WHERE correction_id = ? AND status = 'pending'",
+            (
+                correction.status,
+                correction.reviewed_by,
+                correction.reviewed_by_role,
+                correction.reviewed_at,
+                correction.review_note,
+                correction.applied_at,
+                correction.change_fingerprint,
+                json.dumps(correction.detail, ensure_ascii=False),
+                correction.correction_id,
+            ),
         )
         return cur.rowcount == 1
 

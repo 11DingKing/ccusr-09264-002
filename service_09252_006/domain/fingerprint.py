@@ -69,6 +69,40 @@ def manifest_fingerprint(
     return ALGORITHM + ":" + digest_json(payload)
 
 
+def manifest_content_checksum(
+    package_id: str,
+    institution_id: str,
+    entries: Iterable[Mapping[str, Any]],
+) -> str:
+    """封存前双人确认的“内容校验和”。
+
+    与 manifest_fingerprint 的区别：不含封存时刻，只固定“包里有哪些
+    材料的哪个版本、各自 sha256/kind/敏感度”。两名确认人看到并确认的
+    必须是同一个值；第二人确认时服务端按当前清单重算并与之比对，
+    从而能发现第一人确认后、第二人确认前清单被改动。
+    """
+    normalized_entries = sorted(
+        (
+            {
+                "material_id": str(e["material_id"]),
+                "version_id": str(e["version_id"]),
+                "sha256": str(e["sha256"]),
+                "kind": str(e["kind"]),
+                "sensitivity": str(e["sensitivity"]),
+            }
+            for e in entries
+        ),
+        key=lambda e: (e["material_id"], e["version_id"]),
+    )
+    payload = {
+        "schema": "quality-evidence-manifest-content/v1",
+        "package_id": package_id,
+        "institution_id": institution_id,
+        "entries": normalized_entries,
+    }
+    return ALGORITHM + ":" + digest_json(payload)
+
+
 def review_record_fingerprint(
     package_id: str,
     manifest_fingerprint_value: str,
@@ -111,6 +145,34 @@ def review_record_fingerprint(
         "manifest_fingerprint": manifest_fingerprint_value,
         "requests": norm_requests,
         "objections": norm_objections,
+    }
+    return ALGORITHM + ":" + digest_json(payload)
+
+
+def correction_fingerprint(
+    correction_id: str,
+    package_id: str,
+    base_manifest_fingerprint: str | None,
+    correction_type: str,
+    reason: str,
+    detail: Mapping[str, Any],
+    requested_by: str,
+    reviewed_by: str | None,
+    status: str,
+) -> str:
+    """封存后更正记录的指纹：把“基于哪个封存清单、改了什么、谁审批”
+    绑定成一个不可事后改写的摘要。纯函数，离线核验可直接复算。"""
+    payload = {
+        "schema": "quality-evidence-correction/v1",
+        "correction_id": correction_id,
+        "package_id": package_id,
+        "base_manifest_fingerprint": base_manifest_fingerprint,
+        "correction_type": correction_type,
+        "reason": reason,
+        "detail": dict(detail),
+        "requested_by": requested_by,
+        "reviewed_by": reviewed_by,
+        "status": status,
     }
     return ALGORITHM + ":" + digest_json(payload)
 

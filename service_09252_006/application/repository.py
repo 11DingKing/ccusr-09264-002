@@ -12,12 +12,14 @@ from contextlib import AbstractContextManager
 from ..domain.models import (
     AuditEntry,
     Blob,
+    CorrectionProposal,
     Material,
     MaterialVersion,
     Objection,
     PackageEntry,
     ReviewPackage,
     ReviewRequest,
+    SealConfirmation,
     User,
 )
 
@@ -115,6 +117,66 @@ class Repository(abc.ABC):
         **fields,
     ) -> bool:
         """条件更新；状态不再是 expected_status 时返回 False（并发冲突）。"""
+
+    # ---- 双人封存确认 ----
+    @abc.abstractmethod
+    def insert_seal_confirmation(self, confirmation: SealConfirmation) -> None: ...
+
+    @abc.abstractmethod
+    def get_active_seal_confirmation(
+        self, package_id: str
+    ) -> SealConfirmation | None:
+        """返回该包当前进行中（pending）的确认轮次。"""
+
+    @abc.abstractmethod
+    def get_seal_confirmation(
+        self, confirmation_id: str
+    ) -> SealConfirmation | None: ...
+
+    @abc.abstractmethod
+    def list_seal_confirmations(
+        self, package_id: str
+    ) -> list[SealConfirmation]: ...
+
+    @abc.abstractmethod
+    def mark_seal_confirmation_withdrawn(
+        self,
+        confirmation_id: str,
+        withdrawn_by: str,
+        withdrawn_at: str,
+        reason: str,
+    ) -> bool:
+        """仅当记录仍为 pending 时撤销本轮确认；否则返回 False。"""
+
+    @abc.abstractmethod
+    def complete_seal_confirmation(
+        self,
+        confirmation_id: str,
+        second_confirmer_id: str,
+        second_confirmer_role: str,
+        second_confirmed_at: str,
+        sealed_at: str,
+        sealed_manifest_fingerprint: str,
+    ) -> bool:
+        """仅当记录仍为 pending 时写入第二确认人并置 sealed；否则 False。"""
+
+    # ---- 封存后更正 ----
+    @abc.abstractmethod
+    def insert_correction(self, correction: CorrectionProposal) -> None: ...
+
+    @abc.abstractmethod
+    def get_correction(self, correction_id: str) -> CorrectionProposal | None: ...
+
+    @abc.abstractmethod
+    def list_corrections(self, package_id: str) -> list[CorrectionProposal]: ...
+
+    @abc.abstractmethod
+    def update_correction(self, correction: CorrectionProposal) -> bool:
+        """条件更新：以 status='pending' 为前置，防止重复审批。"""
+
+    @abc.abstractmethod
+    def rename_package_title(self, package_id: str, title: str) -> bool:
+        """元数据更正：仅订正标题，不触碰清单指纹。"""
 
     # ---- 评审请求 ----
     @abc.abstractmethod

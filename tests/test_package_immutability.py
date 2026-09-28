@@ -89,8 +89,13 @@ class PackageImmutabilityTests(unittest.TestCase):
             package_id=re["package_id"],
             version_id=late.version["version_id"],
         )
-        resealed = self.h.ctx.packages.seal_package(
+        started = self.h.ctx.packages.start_seal_confirmation(
             self.admin, package_id=re["package_id"]
+        )
+        resealed = self.h.ctx.packages.confirm_seal(
+            self.authority,
+            package_id=re["package_id"],
+            confirmation_id=started["confirmation_id"],
         )
         # 新包指纹不同于旧包
         self.assertNotEqual(
@@ -161,8 +166,9 @@ class PackageImmutabilityTests(unittest.TestCase):
         self.h.ctx.evidence.withdraw_version(
             self.admin, version_id=item.version["version_id"], reason="事后撤回"
         )
+        # 第一人启动确认时即拦截已撤回版本
         with self.assertRaises(ConflictError):
-            self.h.ctx.packages.seal_package(
+            self.h.ctx.packages.start_seal_confirmation(
                 self.admin, package_id=pkg["package_id"]
             )
 

@@ -40,6 +40,19 @@ class RequestStatus(str, Enum):
     CANCELLED = "cancelled"  # 被重新分配
 
 
+class SealConfirmationStatus(str, Enum):
+    PENDING = "pending"      # 第一人已确认，等待第二人（可撤回）
+    CANCELLED = "cancelled"  # 第二人确认前被撤回，本轮确认作废
+    SEALED = "sealed"        # 双人确认完成，封存生效
+
+
+class CorrectionType(str, Enum):
+    METADATA = "metadata"                  # 元数据订正（标题等）
+    ENTRY_REPLACE = "entry_replace"        # 替换条目版本
+    ENTRY_WITHDRAW = "entry_withdraw"      # 撤回条目
+    OTHER = "other"
+
+
 class Verdict(str, Enum):
     APPROVE = "approve"
     OBJECT = "object"  # 有异议

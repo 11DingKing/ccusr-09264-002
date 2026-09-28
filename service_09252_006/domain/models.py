@@ -99,6 +99,65 @@ class ReviewPackage:
 
 
 @dataclass
+class SealConfirmation:
+    """封存前的双人确认留痕：两名不同角色先后确认内容与校验和。
+
+    第二人确认前任一人可撤回（status=cancelled）；两人都确认后封存生效
+    （status=sealed），并记录 package 上的封存时刻与清单指纹。
+
+    content_checksum 只覆盖清单内容（不含封存时刻），两名确认人确认的是
+    同一个值；sealed_manifest_fingerprint 在第二人确认完成时按封存时刻
+    生成，与 packages.manifest_fingerprint 一致，供离线核验复算。
+    """
+
+    confirmation_id: str
+    package_id: str
+    institution_id: str
+    status: str                    # SealConfirmationStatus
+    content_checksum: str          # 待封存清单的内容校验和（两人确认同一值）
+    entry_count: int
+    first_confirmer_id: str
+    first_confirmer_role: str
+    first_confirmed_at: str
+    second_confirmer_id: Optional[str]
+    second_confirmer_role: Optional[str]
+    second_confirmed_at: Optional[str]
+    withdrawn_by: Optional[str]
+    withdrawn_at: Optional[str]
+    withdraw_reason: Optional[str]
+    sealed_at: Optional[str]
+    sealed_manifest_fingerprint: Optional[str] = None
+
+
+@dataclass
+class CorrectionProposal:
+    """封存后更正：任何对已封存证据包的改动只能走更正流程留痕。
+
+    双人角色隔离：申请人（requested_by_role）与批准人（reviewed_by_role）
+    必须是封存两角色中的不同角色、不同用户。元数据订正（不进入清单指纹）
+    可在批准后原地生效；涉及条目内容的结构性变更不能改写历史清单，只能
+    凭批准记录走既有的复审包（supersedes）流程。
+    """
+
+    correction_id: str
+    package_id: str
+    institution_id: str
+    correction_type: str           # CorrectionType
+    reason: str
+    detail: dict
+    status: str                    # pending / approved / rejected / applied
+    requested_by: str
+    requested_by_role: str
+    requested_at: str
+    reviewed_by: Optional[str]
+    reviewed_by_role: Optional[str]
+    reviewed_at: Optional[str]
+    review_note: Optional[str]
+    applied_at: Optional[str]
+    change_fingerprint: Optional[str] = None
+
+
+@dataclass
 class ReviewRequest:
     request_id: str
     package_id: str

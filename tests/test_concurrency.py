@@ -111,6 +111,66 @@ class ConcurrencyTests(unittest.TestCase):
         self.assertEqual(pkg.status, "decided")
         self.assertEqual(pkg.decision, outcomes[0])
 
+    def test_concurrent_second_confirmation_and_withdraw_only_one_wins(self) -> None:
+        # 单独造一个停在“第一人已确认”的草稿包
+        from tests.flow import upload_material
+
+        pkg = self.h.ctx.packages.create_package(self.admin, title="竞态封存")
+        item = upload_material(self.h, self.admin, data=b"race")
+        self.h.ctx.packages.add_entry(
+            self.admin, package_id=pkg["package_id"],
+            version_id=item.version["version_id"],
+        )
+        started = self.h.ctx.packages.start_seal_confirmation(
+            self.admin, package_id=pkg["package_id"]
+        )
+        cid = started["confirmation_id"]
+        pid = pkg["package_id"]
+        outcomes: list[str] = []
+        lock = threading.Lock()
+
+        def confirm() -> None:
+            ctx = self._worker_context()
+            try:
+                authority = ctx.repo.get_user("auth")
+                ctx.packages.confirm_seal(
+                    authority, package_id=pid, confirmation_id=cid
+                )
+                with lock:
+                    outcomes.append("sealed")
+            except DomainError:
+                with lock:
+                    outcomes.append("confirm_lost")
+            finally:
+                ctx.close()
+
+        def withdraw() -> None:
+            ctx = self._worker_context()
+            try:
+                admin = ctx.repo.get_user("admin-a")
+                ctx.packages.withdraw_seal_confirmation(
+                    admin, package_id=pid
+                )
+                with lock:
+                    outcomes.append("withdrawn")
+            except DomainError:
+                with lock:
+                    outcomes.append("withdraw_lost")
+            finally:
+                ctx.close()
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+            futs = [pool.submit(confirm), pool.submit(withdraw)]
+            concurrent.futures.wait(futs)
+
+        self.assertEqual(len(outcomes), 2)
+        self.assertEqual(len(set(outcomes)), 2)  # 一胜一负，不会同时成功
+        pkg = self.h.repo.get_package(pid)
+        if "sealed" in outcomes:
+            self.assertEqual(pkg.status, "sealed")
+        else:
+            self.assertEqual(pkg.status, "draft")
+
 
 if __name__ == "__main__":
     unittest.main()

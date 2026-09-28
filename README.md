@@ -14,11 +14,30 @@
   服务端重算摘要，客户端可传 `expected_sha256` 做端到端校验。
 - 同一逻辑材料有不可变的版本链（`versions.supersedes_version_id`），
   重复上传相同字节返回既有版本。
-- 评审包封存时，对“包内每个条目的 material/version/sha256/kind/敏感度
-  + 封存时刻”做规范化 JSON 哈希，得到 **manifest_fingerprint**。封存后
-  再上传新版本或撤回材料都**不改变历史包**。
+- 封存采用**双人两角色确认**（机构管理员 + 质量权威机构，顺序不限，
+  但两名确认人必须是不同用户、不同角色）：第一人 `/seal/start` 固定
+  待封存清单的**内容校验和**（只含清单，不含时刻）；第二人 `/seal/confirm`
+  时服务端复算校验和，确认第一人确认后清单未被改动，才生成含封存时刻的
+  **manifest_fingerprint** 并置为 sealed。
+- **第二人确认前可撤回**：任一封存角色可 `/seal/withdraw` 作废本轮确认，
+  包保持 draft，撤回轮次（cancelled）与成功轮次（sealed）都留痕；确认
+  进行中清单被锁定，不能追加/改动，撤回事务与第二人确认互斥（条件更新，
+  并发下只有一方生效）。
+- 封存后再上传新版本或撤回材料都**不改变历史包**。
 - 签发结论时对全部评审请求与异议再哈希，得到 **review_fingerprint**，
   其中嵌入 manifest_fingerprint，形成证据链。
+
+### 封存后只能走更正流程
+- 已封存包的任何直接改动（追加条目、替换版本）一律拒绝
+  （`409 immutability_violation`）。
+- 改动必须先提**更正申请**（`/corrections`），由**另一封存角色、另一
+  用户**审批（申请人不能自批，评审人无权审批），每条更正带原因与
+  **change_fingerprint**，离线核验复算。
+- 元数据订正（如标题）批准后原地生效，**不改变清单指纹**；涉及条目的
+  结构性更正（替换/撤回）批准即授权，但**不改写历史清单**，实际替换在
+  签发后通过既有复审包（supersedes 链）落地。
+- 离线核验复算双人确认的内容校验和、封存指纹、两角色隔离，以及更正
+  记录的变更指纹；旧库缺少双人确认留痕只报警告。
 
 ### 后补文件只能复审
 - 已封存/已决定的包拒绝追加材料（`409 immutability_violation`）。
@@ -96,7 +115,13 @@ python3 -m service_09252_006.cli verify --db ./data/qe.db [--json]
 | POST | `/v1/materials/{id}/withdraw` | 撤回整份材料 |
 | POST | `/v1/packages` | 建评审包（可带 `supersedes_package_id`） |
 | POST | `/v1/packages/{id}/entries` | 草稿包追加版本 |
-| POST | `/v1/packages/{id}/seal` | 封存（固定清单指纹） |
+| POST | `/v1/packages/{id}/seal/start` | 双人封存·第一人确认（固定内容校验和） |
+| POST | `/v1/packages/{id}/seal/confirm` | 双人封存·第二人确认（复算校验和后封存） |
+| POST | `/v1/packages/{id}/seal/withdraw` | 第二人确认前撤回本轮封存确认 |
+| GET  | `/v1/packages/{id}/seal` | 封存确认留痕（cancelled/sealed 轮次） |
+| POST | `/v1/packages/{id}/corrections` | 封存后提更正申请 |
+| GET  | `/v1/packages/{id}/corrections` | 列更正记录 |
+| POST | `/v1/corrections/{id}/review` | 另一封存角色审批更正（approve=false 拒绝） |
 | GET  | `/v1/packages/{id}` | 包视图（敏感条目按权限遮蔽） |
 | GET  | `/v1/packages/{id}/entries/{vid}/content` | 授权下载内容字节 |
 | POST | `/v1/packages/{id}/assignments` | 分配评审（可带跨时区截止） |
@@ -117,10 +142,13 @@ python3 -m unittest discover -s tests -v
 python3 -m compileall -q service_09252_006 tests
 ```
 
-覆盖：内容寻址与版本链、封存不变量、**材料撤回**（封存前后）、后补材料
-只能复审、**最小披露与权限变化**（取消/拒绝/角色调整/跨机构）、
-**跨时区截止**（上海/伦敦/洛杉矶）、异议与签发约束、幂等重放与失败重试、
-多连接**并发复审**、离线核验对字节/清单/评审篡改的检出，以及完整 HTTP
-端到端流程。
+覆盖：内容寻址与版本链、**双人两角色封存**（两种角色校验、确认顺序与
+校验和留痕、第二人确认前撤回、撤回后重新封存）、封存不变量、**封存后
+更正流程**（角色隔离、元数据订正不改指纹、结构性更正须复审）、**材料
+撤回**（封存前后）、后补材料只能复审、**最小披露与权限变化**
+（取消/拒绝/角色调整/跨机构）、**跨时区截止**（上海/伦敦/洛杉矶）、
+异议与签发约束、幂等重放与失败重试、多连接**并发复审与封存竞态**、
+v1→v2 模式迁移、离线核验对字节/清单/双人确认/更正/评审篡改的检出，
+以及完整 HTTP 端到端流程（含撤回与封存后更正）。
 
 扩展模块覆盖证据、审批、权限、留存、对账与恢复等业务边界。
